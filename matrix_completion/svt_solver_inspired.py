@@ -11,11 +11,46 @@ import numpy as np
 from numpy import linalg as la
 import time
 import os
-import numpy as np
-import logging
 
-from sklearn.utils.extmath import randomized_svd, svd_flip
-from scipy.sparse.linalg import svds
+
+def variance_scaled_ls_probs(m, n, A):
+    # populates array with the row-norms squared of matrix A
+    row_norms = np.zeros(m)
+    for i in range(m):
+        row_norms[i] = np.abs(la.norm(A[i, :]))**2
+
+    # Frobenius norm of A
+    A_Frobenius = np.sqrt(np.sum(row_norms))
+
+    LS_prob_rows = np.zeros(m)
+
+    # normalized length-square row probability distribution
+    for i in range(m):
+        LS_prob_rows[i] = row_norms[i] / A_Frobenius**2
+
+    LS_prob_columns = np.zeros((m, n))
+
+    # populates array with length-square column probability distributions
+    # LS_prob_columns[i]: LS probability distribution for selecting columns from row A[i]
+    for i in range(m):
+        LS_prob_columns[i, :] = [np.abs(k)**2 / row_norms[i] for k in A[i, :]]
+
+    # New part: compute variances and adjust the probabilities
+    row_vars = np.var(A, axis=1)  # row variances
+    col_vars = np.var(A, axis=0)  # column variances
+
+    row_adj = 1 / (1 + row_vars)  # adjust row probabilities - lower for high variance
+    col_adj = 1 / (1 + col_vars)  # adjust column probabilities - lower for high variance
+
+    LS_prob_rows *= row_adj  # adjust row probabilities
+    LS_prob_rows /= np.sum(LS_prob_rows)  # renormalize
+
+    for i in range(m):
+        LS_prob_columns[i, :] *= col_adj  # adjust column probabilities
+        LS_prob_columns[i, :] /= np.sum(LS_prob_columns[i, :])  # renormalize each row
+
+    return row_norms, LS_prob_rows, LS_prob_columns, A_Frobenius
+
 
 
 def ls_probs(m, n, A):
@@ -121,8 +156,17 @@ def sample_C(A, m, n, r, c, row_norms, LS_prob_rows, LS_prob_columns, A_Frobeniu
     for t in range(c):
         C[:, t] = R_C[:, t] * (A_Frobenius / np.sqrt(column_norms[t])) / np.sqrt(c)
 
+    toc = time.time()
+    rt_building_C = toc - tic
 
-    return C
+    tic = time.time()
+    # Computing the SVD of sampled C matrix
+    w, sigma, vh = la.svd(C, full_matrices=False)
+
+    toc = time.time()
+    rt_svd_C = toc - tic
+
+    return w, rows, sigma, vh, rt_sampling_C, rt_building_C, rt_svd_C
 
 
 def vl_vector(l, A, r, w, rows, sigma, row_norms, A_Frobenius):
@@ -184,94 +228,86 @@ def uvl_vector(l, A, r, w, rows, sigma, row_norms, A_Frobenius):
     return u_approx, v_approx
 
 
-def _my_svd(M, k, algorithm):
-    if algorithm == 'randomized':
-        (U, S, V) = randomized_svd(
-            M, n_components=min(k, M.shape[1]-1), n_oversamples=20)
-    elif algorithm == 'arpack':
-        (U, S, V) = svds(M, k=min(k, min(M.shape)-1))
-        S = S[::-1]
-        U, V = svd_flip(U[:, ::-1], V[::-1])
-    else:
-        raise ValueError("unknown algorithm")
-    return (U, S, V)
+def svt_solve_inspired(A, r, c, rank, mask, delta, tau=None, max_iterations=1000, epsilon=1e-5):
 
-def svt_solve(
-        A, 
-        mask, 
-        tau=None, 
-        delta=None, 
-        epsilon=1e-2,
-        rel_improvement=-0.01,
-        max_iterations=1000,
-        algorithm='arpack'):
-    """
-    Solve using iterative singular value thresholding.
+    r""" Function to solve the the linear system of equations :math:'A \bm{x} = b' using FKV algorithm
+    and a direct calculation of the coefficients :math: '\lambda_l' and solution vector :math: '\bm{x}'
 
-    [ Cai, Candes, and Shen 2010 ]
-
-    Parameters:
-    -----------
-    A : m x n array
-        matrix to complete
-
-    mask : m x n array
-        matrix with entries zero (if missing) or one (if present)
-
-    tau : float
-        singular value thresholding amount;, default to 5 * (m + n) / 2
-
-    delta : float
-        step size per iteration; default to 1.2 times the undersampling ratio
-
-    epsilon : float
-        convergence condition on the relative reconstruction error
-
-    max_iterations: int
-        hard limit on maximum number of iterations
-
-    algorithm: str, 'arpack' or 'randomized' (default='arpack')
-        SVD solver to use. Either 'arpack' for the ARPACK wrapper in 
-        SciPy (scipy.sparse.linalg.svds), or 'randomized' for the 
-        randomized algorithm due to Halko (2009).
+    Args:
+        A (array[complex]): rectangular, in general, complex matrix
+        r (int): number of sampled rows from matrix A
+        c (int): number of sampled columns from matrix A
+        rank (int): rank of matrix A
 
     Returns:
-    --------
-    X: m x n array
-        completed matrix
+        array[float]: array containing the components of the solution vector :math: '\bm{x}'
     """
     logger = logging.getLogger(__name__)
-    if algorithm not in ['randomized', 'arpack']:
-        raise ValueError("unknown algorithm %r" % algorithm)
-    Y = np.zeros_like(A)
-
+    Y = mask * A
+    
+    m_rows, n_cols = np.shape(A)
+    
     if not tau:
-        tau = 5 * np.sum(A.shape) / 2
-    if not delta:
-        delta = 1.2 * np.prod(A.shape) / np.sum(mask)
+        tau = 5 * (m_rows + n_cols) / 2
 
-    r_previous = 0
+    # 1- Generating LS probability distributions used to sample rows and columns indices of matrix A
+    tic = time.time()
+
+    LS = ls_probs(m_rows, n_cols, Y)
+    
+    
+    # save reconstruction error for drawing
+    rec_errors = []
 
     for k in range(max_iterations):
+        
+        toc = time.time()
+        
+        rt_ls_prob = toc - tic
+        
         if k == 0:
             X = np.zeros_like(A)
         else:
-            sk = r_previous + 1
-            (U, S, V) = _my_svd(Y, sk, algorithm)
-            while np.min(S) >= tau:
-                sk = sk + 5
-                (U, S, V) = _my_svd(Y, sk, algorithm)
-            shrink_S = np.maximum(S - tau, 0)
+            # 2- Building matrix C by sampling "r" rows and "c" columns from matrix A and computing SVD of matrix C
+            svd_C = sample_C(Y, m_rows, n_cols, r, c, *LS[0:4])
+            w = svd_C[0]
+            sigma = svd_C[2]
+            
+            ul_approx = np.zeros((m_rows, rank))
+            vl_approx = np.zeros((n_cols, rank))
+            for l in range(rank):
+                ul_approx[:, l], vl_approx[:, l] = uvl_vector(l, Y, r, w, svd_C[1], sigma, LS[0], LS[3])
+            
+            shrink_S = np.maximum(sigma - tau, 0)
             r_previous = np.count_nonzero(shrink_S)
-            diag_shrink_S = np.diag(shrink_S)
-            X = np.linalg.multi_dot([U, diag_shrink_S, V])
-        Y += delta * mask * (A - X)
-
+            
+            # Apply regularization to singular values
+            sigma = sigma / (1 + delta)
+    
+            diag_shrink_S = np.diag(shrink_S[:rank])
+            
+            print(diag_shrink_S)
+            
+            X_new = np.linalg.multi_dot([ul_approx, diag_shrink_S, vl_approx.T])
+                
+            X = 0.9 * X + 0.1 * X_new
+            
+            Y = delta * mask * (Y - X)
+        
         recon_error = np.linalg.norm(mask * (X - A)) / np.linalg.norm(mask * A)
-        if k % 1 == 0:
+        rec_errors.append(recon_error)
+        if k % 10 == 0:
             logger.info("Iteration: %i; Rel error: %.4f" % (k + 1, recon_error))
+    
         if recon_error < epsilon:
             break
+        
+    # draw reconstruction error with iterations
+    plt.figure()
+    plt.plot(rec_errors)
+    plt.xlabel('Iterations')
+    plt.ylabel('Reconstruction error')
+    plt.savefig('reconstruction_error.png')
 
     return X
-
+        
