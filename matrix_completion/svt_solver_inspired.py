@@ -156,17 +156,7 @@ def sample_C(A, m, n, r, c, row_norms, LS_prob_rows, LS_prob_columns, A_Frobeniu
     for t in range(c):
         C[:, t] = R_C[:, t] * (A_Frobenius / np.sqrt(column_norms[t])) / np.sqrt(c)
 
-    toc = time.time()
-    rt_building_C = toc - tic
-
-    tic = time.time()
-    # Computing the SVD of sampled C matrix
-    w, sigma, vh = la.svd(C, full_matrices=False)
-
-    toc = time.time()
-    rt_svd_C = toc - tic
-
-    return w, rows, sigma, vh, rt_sampling_C, rt_building_C, rt_svd_C
+    return C, rows, columns
 
 
 def vl_vector(l, A, r, w, rows, sigma, row_norms, A_Frobenius):
@@ -190,8 +180,12 @@ def vl_vector(l, A, r, w, rows, sigma, row_norms, A_Frobenius):
     v_approx = np.zeros(n)
     # building approximated v^l vector
     factor = A_Frobenius / ( np.sqrt(r) * sigma[l] )
+    print("vl_vector")
+    print(v_approx)
     for s in range(r):
+        print(s)
         v_approx[:] += ( A[rows[s], :] / np.sqrt(row_norms[rows[s]]) ) * w[s, l]
+        
     v_approx[:] = v_approx[:] * factor
 
     return v_approx
@@ -217,18 +211,133 @@ def uvl_vector(l, A, r, w, rows, sigma, row_norms, A_Frobenius):
     m, n = A.shape
     u_approx = np.zeros(m)
     v_approx = np.zeros(n)
+    
     # building approximated v^l vector
     factor = A_Frobenius / ( np.sqrt(r) * sigma[l] )
+    
     for s in range(r):
         v_approx[:] += ( A[rows[s], :] / np.sqrt(row_norms[rows[s]]) ) * w[s, l]
+    
     v_approx[:] = v_approx[:] * factor
-
+    #print(sigma)
     u_approx = (A @ v_approx) / sigma[l]
+    
+    #print(v_approx)
 
     return u_approx, v_approx
 
 
-def svt_solve_inspired(A, r, c, rank, mask, delta, tau=None, max_iterations=1000, epsilon=1e-5):
+def _my_svd(M, k, algorithm):
+    if algorithm == 'randomized':
+        (U, S, V) = randomized_svd(
+            M, n_components=min(k, M.shape[1]-1), n_oversamples=20)
+    elif algorithm == 'arpack':
+        (U, S, V) = svds(M, k=min(k, min(M.shape)-1))
+        S = S[::-1]
+        U, V = svd_flip(U[:, ::-1], V[::-1])
+    else:
+        raise ValueError("unknown algorithm")
+    return (U, S, V)
+
+def svt_solve(
+        A, 
+        mask,
+        rank,
+        tau = None, 
+        delta = None, 
+        epsilon = 1e-2,
+        rel_improvement = -0.01,
+        max_iterations= 100,
+        algorithm='arpack'):
+    """
+    Solve using iterative singular value thresholding.
+
+    [ Cai, Candes, and Shen 2010 ]
+
+    Parameters:
+    -----------
+    A : m x n array
+        matrix to complete
+
+    mask : m x n array
+        matrix with entries zero (if missing) or one (if present)
+
+    tau : float
+        singular value thresholding amount;, default to 5 * (m + n) / 2
+
+    delta : float
+        step size per iteration; default to 1.2 times the undersampling ratio
+
+    epsilon : float
+        convergence condition on the relative reconstruction error
+
+    max_iterations: int
+        hard limit on maximum number of iterations
+
+    algorithm: str, 'arpack' or 'randomized' (default='arpack')
+        SVD solver to use. Either 'arpack' for the ARPACK wrapper in 
+        SciPy (scipy.sparse.linalg.svds), or 'randomized' for the 
+        randomized algorithm due to Halko (2009).
+
+    Returns:
+    --------
+    X: m x n array
+        completed matrix
+    """
+    logger = logging.getLogger(__name__)
+    if algorithm not in ['randomized', 'arpack']:
+        raise ValueError("unknown algorithm %r" % algorithm)
+    Y = np.zeros_like(A)
+
+    if not tau:
+        tau = 5 * np.sum(A.shape) / 2
+    if not delta:
+        delta = 1.2 * np.prod(A.shape) / np.sum(mask)
+    r_previous = 0
+    for k in range(max_iterations):
+        #print(k)
+        if k == 0:
+            X = np.zeros_like(A)
+        else:
+            sk = r_previous + 1
+            (U, S, V) = _my_svd(Y, sk, algorithm)
+            #print(S)
+            #print(tau)
+            while ((np.min(S) >= tau)): #(sk <= rank - 1) 
+                sk = sk + 1
+                (U, S, V) = _my_svd(Y, sk, algorithm)
+                #print(S)
+
+            shrink_S = np.maximum(S - tau, 0)
+            r_previous = np.count_nonzero(shrink_S)
+            diag_shrink_S = np.diag(shrink_S)
+            X = np.linalg.multi_dot([U, diag_shrink_S, V])
+
+            #print(X)
+        Y += delta * mask * (A - X)
+
+        recon_error = np.linalg.norm(mask * (X - A)) / np.linalg.norm(mask * A)
+        # print(recon_error)
+        if k % 1 == 0:
+            logger.info("Iteration: %i; Rel error: %.4f" % (k + 1, recon_error))
+        if recon_error < epsilon:
+            break
+    
+    # check shrink_S is zero, and remove the zero singular values and corresponding U, V
+    shrink_S = np.maximum(S - tau, 0)
+    r_previous = np.count_nonzero(shrink_S)
+    diag_shrink_S = np.diag(shrink_S)
+    X = np.linalg.multi_dot([U[:, :r_previous], diag_shrink_S[:r_previous, :r_previous], V[:r_previous, :]])
+    U = U[:, :r_previous]
+    V = V[:r_previous, :]
+    shrink_S = shrink_S[:r_previous]
+
+    return X, U, shrink_S, V
+
+
+
+
+def svt_solve_inspired(A, r, c, rank, mask, delta = None, tau=None, max_iterations=1000, epsilon=1e-2):
 
     r""" Function to solve the the linear system of equations :math:'A \bm{x} = b' using FKV algorithm
     and a direct calculation of the coefficients :math: '\lambda_l' and solution vector :math: '\bm{x}'
@@ -248,18 +357,23 @@ def svt_solve_inspired(A, r, c, rank, mask, delta, tau=None, max_iterations=1000
     m_rows, n_cols = np.shape(A)
     
     if not tau:
-        tau = 5 * (m_rows + n_cols) / 2
+        tau = 5 * np.sum(A.shape) / 2
+    if not delta:
+        delta = 1.2 * r * c / np.sum(mask)
 
     # 1- Generating LS probability distributions used to sample rows and columns indices of matrix A
     tic = time.time()
 
     LS = ls_probs(m_rows, n_cols, Y)
     
-    
     # save reconstruction error for drawing
     rec_errors = []
+    rec_errors.append(1)
+    
+    X_output = np.zeros_like(A)
 
-    for k in range(max_iterations):
+    for k in range(100):
+        print(k)
         
         toc = time.time()
         
@@ -269,33 +383,63 @@ def svt_solve_inspired(A, r, c, rank, mask, delta, tau=None, max_iterations=1000
             X = np.zeros_like(A)
         else:
             # 2- Building matrix C by sampling "r" rows and "c" columns from matrix A and computing SVD of matrix C
-            svd_C = sample_C(Y, m_rows, n_cols, r, c, *LS[0:4])
-            w = svd_C[0]
-            sigma = svd_C[2]
+            C, rows, columns = sample_C(Y, m_rows, n_cols, r, c, *LS[0:4])
             
-            ul_approx = np.zeros((m_rows, rank))
-            vl_approx = np.zeros((n_cols, rank))
-            for l in range(rank):
-                ul_approx[:, l], vl_approx[:, l] = uvl_vector(l, Y, r, w, svd_C[1], sigma, LS[0], LS[3])
+            #print(C)
+            # populates array for matrix R with the submatrix of A defined by sampled rows/columns
+            mask_C = np.zeros((r, c))
+            for s in range(r):
+                for t in range(c):
+                    if mask[rows[s], columns[t]] == 1:
+                        mask_C[s, t] = 1
+
+            #print(mask_C)
+            # 3- Computing SVD of matrix C
+            result_X, U, shrink_S, V =  svt_solve(C, mask_C, rank, tau = tau)
             
-            shrink_S = np.maximum(sigma - tau, 0)
-            r_previous = np.count_nonzero(shrink_S)
+            
+            S_rank = len(shrink_S)
+            print(shrink_S)
+            
+            ul_approx = np.zeros((m_rows, S_rank))
+            vl_approx = np.zeros((n_cols, S_rank))
+            
+            # the rank is different
+            
+            for l in range(S_rank):
+                ul_approx[:, l], vl_approx[:, l] = uvl_vector(l, Y, r, U, rows, shrink_S, LS[0], LS[3])
+            #print("cut point uv")
+            
+            # the ul_approx and vl_approx are too large
+            
+            # shrink_S = np.maximum(sigma - tau, 0)
+            # r_previous = np.count_nonzero(shrink_S)
             
             # Apply regularization to singular values
-            sigma = sigma / (1 + delta)
+            #shrink_S = shrink_S / (1 + 0.1)
     
-            diag_shrink_S = np.diag(shrink_S[:rank])
+            diag_shrink_S = np.diag(shrink_S[:S_rank])
+            
+            X = np.linalg.multi_dot([ul_approx, diag_shrink_S, vl_approx.T])
+            
+            # print("cut point recover")
+            
+            # print(ul_approx)
             
             print(diag_shrink_S)
-            
-            X_new = np.linalg.multi_dot([ul_approx, diag_shrink_S, vl_approx.T])
-                
-            X = 0.9 * X + 0.1 * X_new
-            
-            Y = delta * mask * (Y - X)
+        
+        #Y += delta * mask * (A - X)
+        #print(Y)
         
         recon_error = np.linalg.norm(mask * (X - A)) / np.linalg.norm(mask * A)
-        rec_errors.append(recon_error)
+        
+        if recon_error < rec_errors[-1]:
+            print(recon_error)
+            rec_errors.append(recon_error)
+            X_output = X
+        #else:
+            #Y -= delta * mask * (A - X)
+            
         if k % 10 == 0:
             logger.info("Iteration: %i; Rel error: %.4f" % (k + 1, recon_error))
     
@@ -304,10 +448,11 @@ def svt_solve_inspired(A, r, c, rank, mask, delta, tau=None, max_iterations=1000
         
     # draw reconstruction error with iterations
     plt.figure()
+    print(rec_errors)
     plt.plot(rec_errors)
     plt.xlabel('Iterations')
     plt.ylabel('Reconstruction error')
     plt.savefig('reconstruction_error.png')
 
-    return X
+    return X_output
         

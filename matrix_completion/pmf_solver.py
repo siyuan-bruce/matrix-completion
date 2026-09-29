@@ -256,6 +256,7 @@ def pmf_solve(A, mask, k, mu, epsilon=1e-3, max_iterations=100):
         X = np.dot(U, V.T)
 
         mean_diff = np.linalg.norm(X - prev_X) / m / n
+        print(mean_diff)
         if _ % 1 == 0:
             logger.info("Iteration: %i; Mean diff: %.4f" % (_ + 1, mean_diff))
         if mean_diff < epsilon:
@@ -266,43 +267,49 @@ def pmf_solve(A, mask, k, mu, epsilon=1e-3, max_iterations=100):
 
 
 def pmf_solve_inspired(A, r, c, rank, mask, mu, max_iterations=1000, epsilon=1e-5):
+    
+    logger = logging.getLogger(__name__)
     m_rows, n_cols = np.shape(A)
     U = np.random.randn(m_rows, rank)
     V = np.random.randn(n_cols, rank)
+    
+    m, n = A.shape
 
     # 1- Generating LS probability distributions used to sample rows and columns indices of matrix A
     Y = mask * A
     LS = ls_probs(m_rows, n_cols, Y)
     rec_errors = []
     
+    prev_X = np.dot(U, V.T)
+    
     for k in range(max_iterations):
-        if k == 0:
-            X = np.zeros_like(A)
-        else:
-    
-            # Sample and update a subset of rows in U
-            sampled_rows = np.random.choice(m_rows, size=r, p=LS[1])  # LS[1] is the row sampling distribution
-            for i in sampled_rows:
-                U[i] = np.linalg.solve(np.linalg.multi_dot([V.T, V]) +
-                                        mu * np.eye(rank),
-                                        np.linalg.multi_dot([V.T, Y[i, :]]))
-    
-            # Sample and update a subset of columns in V
-            sampled_columns = np.random.choice(n_cols, size=c, p=LS[2])  # Assume LS[2] is the column sampling distribution
-            for j in sampled_columns:
-                V[j] = np.linalg.solve(np.linalg.multi_dot([U.T, U]) +
-                                        mu * np.eye(rank),
-                                        np.linalg.multi_dot([U.T, Y[:, j]]))
+        # Sample and update a subset of rows in U
+        sampled_rows = np.random.choice(m_rows, size=r, p=LS[1])  # LS[1] is the row sampling distribution
+        #print(sampled_rows)
+        for i in sampled_rows:
+            #print(i)
+            U[i] = np.linalg.solve(np.linalg.multi_dot([V.T, V]) +
+                                    mu * np.eye(rank),
+                                    np.linalg.multi_dot([V.T, Y[i, :]]))
+
+        # Sample and update a subset of columns in V
+        sampled_columns = np.random.choice(n_cols, size=c, p=LS[2])  # Assume LS[2] is the column sampling distribution
+        for j in sampled_columns:
+            V[j] = np.linalg.solve(np.linalg.multi_dot([U.T, U]) +
+                                    mu * np.eye(rank),
+                                    np.linalg.multi_dot([U.T, Y[:, j]]))
     
             # New solution
-            X_new = np.linalg.multi_dot([U, V.T])
-            X = 0.9 * X + 0.1 * X_new
+        X = np.linalg.multi_dot([U, V.T])
+            #X = 0.9 * X + 0.1 * X_new
     
-        # Calculate error
-        recon_error = np.linalg.norm(mask * (X - A)) / np.linalg.norm(mask * A)
-        rec_errors.append(recon_error)
-        if recon_error < epsilon:
+        mean_diff = np.linalg.norm(X - prev_X) / m / n
+        print(mean_diff)
+        if k % 1 == 0:
+            logger.info("Iteration: %i; Mean diff: %.4f" % (k + 1, mean_diff))
+        if mean_diff < epsilon:
             break
+        prev_X = X
         
     return X
 
